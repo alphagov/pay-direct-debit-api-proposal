@@ -1,0 +1,632 @@
+FORMAT: 1A
+HOST: http://publicapi.payments.service.gov.uk/
+
+# GOV.UK Pay Recurring Payments API proposal
+
+## Document status
+
+1/3/2018 - first draft request for comments
+
+## Who is this for?
+
+This is a proposal is intended for two audiences:
+
+- government services who are considering processing Direct Debit payments using GOV.UK Pay, but who currently don't use the service
+- current GOV.UK Pay partner services with an existing integration
+
+The proposal assumes you have some familiarity with [our existing API](https://govukpay-docs.cloudapps.digital/#overview-of-payment-flow).
+
+## Evolving GOV.UK Pay's public API to support recurring payments
+
+We're introducing support for Direct Debit payments, including recurring payments. We aim to ensure that our API will work for any payment method.
+
+In order to support this change, we are introducing the concept of an **agreement**, which represents
+an individual payer's consent for future payments using a particular funding source. 
+
+For Direct Debit, GOV.UK Pay will fulfil an agreement by registering a Direct Debit instruction (also known as a 'mandate') with the payer's bank. 
+
+Although we [don't have immediate plans](https://www.payments.service.gov.uk/roadmap/) to support recurring card payments, we can use the same API for this. In this scenario, we would fulfil an agreement by taking card details together with explicit consent to make future payments using that card.
+
+## Immediate vs Delayed payment methods
+
+Card payments are an **immediate** payment method. When a user completes a card payment using GOV.UK Pay, we confirm immediately to your service whether the payment has succeeded or failed. So, if a user pays by card, you can immediately release your service to the user.
+
+Direct Debit payments are a **delayed** payment method. When a user completes a Direct Debit payment using GOV.UK Pay, we make a request to their bank to set up the Direct Debit mandate and transfer the funds, but we're not able to confirm whether that's been successful for several days. 
+
+Once the bank confirms the outcome we send you a [webhook notification](#introduction/webhook-notifications) indicating success or failure.
+
+If the mandate is successfully established, but the payment fails (eg. due to lack of funds in the payer's bank account), we will retry the payment request up to three times. The paying user will be notified by email, to maximise the chances of successful payment.
+
+## One off payments using Direct Debit
+
+You can take one-off payments using Direct Debit. Direct debit typically has a lower transaction fee than card payments, so you might want to choose this option where you want to keep the transaction fee low. 
+
+To take a one-off payment using direct debit, create an API token linked to your direct debit service, and follow the [regular payment flow](https://govukpay-docs.cloudapps.digital/#payment-flow-making-a-payment). 
+
+In this scenario we would set up a direct debit mandate to take the single payment and then immediately cancel it once payment has been collected (TBC).
+
+You would not be able to take further payments from this user without creating a new payment which would require the user to re-enter their payment details again.
+
+## Types of recurring payment
+
+Recurring Direct Debit payments are created using the [POST /v1/agreements](/reference/agreement/agreements-collection/create-an-agreement) endpoint, with different `agreement_type` settings, as follows:
+
+### On demand
+
+An `on demand` agreement allows you to collect payments of any amount at any time.
+
+This gives you the most control over the timing of payments. You will be responsible for initiating the payments by calling our API.
+
+Possible use cases: 
+
+- collect money each time a service is provided
+- collect payments where the amounts vary according to service usage
+- collect regular payments where you don't know in advance how much each payment will be
+
+### Recurring
+
+A `recurring` agreement allows you to specify a fixed payment amount taken according to some repeated schedule. For example:
+
+- £10 once a month
+- £25.99 once a quarter
+
+We take care of triggering the payments according to your requested schedule.
+
+The recurring payment will be taken indefinitely until it is cancelled.
+
+Possible use cases:
+
+- collect money for a monthly subscription. 
+- collect money for an ongoing service with a predictable monthly, quarterly or annual fee
+
+### Scheduled
+
+A `scheduled` agreement works much like a recurring agreement, but instead of giving a recurrence rule you provide a list of dates and amounts to be taken. 
+
+We take care of triggering the payments according to your requested schedule.
+
+Possible use cases:
+
+- an annual schedule of payments where the amounts are not the same every month.
+
+## Setting up a recurring payment
+
+To set up a recurring payment:
+
+1. Create an agreement using `POST /v1/agreement/`, specifying:
+     - a `return_url` where we will direct the user when they have finished setting up the agreement
+     - the `agreement_type` (`on demand`, `recurring` or `scheduled`)
+     - for a `recurring` agreement, the `recurrence_rule` specifying the amount and interval of payments
+     - for a `scheduled` agreement, the proposed payment `schedule` (list of amounts, and dates)
+     - a `description` - human-readable description shown to the paying user when setting up the agreement
+     - a `reference` - your reference for this agreement
+     
+    The response contains a `next_url`
+2. Direct the payer to the `next_url`. 
+3. The payer provides their payment details (eg. bank account number and 
+   sort code for Direct Debit).
+4. We present the payer with a confirmation screen outlining the proposed payment schedule. They grant their consent by clicking 'confirm'.
+5. We securely pass the payer's details on to one of our Direct Debit providers who validate the information.
+6. We return the user to your service using the `return_url` you provided in step one.
+7. Call `GET /v1/agreements/:agreement_id` to check the status of the agreement.
+
+   For a Direct Debit payment, this will initially be `pending` to indicate that the mandate has not 
+   yet been confirmed by the bank. The confirmation process takes [3-4 days](#lifecycle).
+8. After several days, when we receive confirmation, we will notify you via [webhook](#introduction/webhook-notifications) whether the agreement has been successfully activated, or failed.
+
+## Controlling the payment method
+
+The payment method is controlled by the API token used to set up the payment. When you create an API token, you choose which payment gateway that token is connected with (eg. sandbox, Worldpay, or Direct Debit etc). By using different API tokens your service can direct paying users to different payment methods. 
+
+In the future we may introduce features to allow users to chose their payment method.
+
+## Payment status lifecycle - pending status
+
+A payment represents a single payment transaction regardless of payment method. The payment status lifecycle is [described in our current API documentation](https://govukpay-docs.cloudapps.digital/#payment-status-lifecycle):
+
+1. `created` - Payment created; user has not yet visited `next_url`
+2. `started` - User has visited `next_url` and is entering payment details
+3. `submitted` - User has submitted payment details but has not yet clicked Confirm
+4. Finished state:
+    * `success` - User successfully completed the payment
+    * `failed` - User attempted to make a payment but the payment did not complete
+    * `cancelled` - Your service cancelled the payment using an API call or the self-service site
+    * `error` - Something went wrong with GOV.UK Pay or the underlying Payment Service Provider
+
+The current payment state flow diagram is shown here:
+
+![Payment states before](http://draft-public-api-documentation.s3-website-eu-west-1.amazonaws.com/external-payment-states-before.dot.png)
+
+With the [introduction of 'delayed' payment methods](#introduction/immediate-vs-delayed-payment-methods) we will introduce a new non-terminal state, `pending`:
+
+![Payment states after](http://draft-public-api-documentation.s3-website-eu-west-1.amazonaws.com/external-payment-states-after.dot.png)
+
+The **pending** state indicates that payment details have been submitted to the payment provider but they are not yet able to confirm whether the payment has been successful.
+
+When the payment is eventually confirmed by the payment provider we will notify your service via a [webhook](#introduction/webhook-notifications).
+
+## Agreement lifecycle
+
+The agreement can go through the following state transitions. The thinking around this is still quite rough so feedback very welcome.
+
+* `CREATED` -> `STARTED`: payer has visited the `next_url` and landed on the GOV.UK Pay page to enter their payment details
+* `STARTED` -> `SUBMITTED`: payer has provided their payment information, but has not yet confirmed their consent to the **agreement**
+* `SUBMITTED` -> `PENDING`: only used with **delayed** payment types such as Direct Debit. This indicates that payer consent has been given but the agreement has not yet been confirmed with the issuing bank
+* `PENDING` -> `ACTIVE`: the issuing bank has confirmed that funding source (e.g. Direct Debit mandate) is valid
+* `PENDING` -> `FAILED`: the issuing bank has rejected the funding source. Possible reasons: incorrect bank account details, bank account requires multiple signatories to set up a Direct Debit.
+* `PENDING` -> `CANCELLED`: cancelled by the payer
+* `ACTIVE` -> `CANCELLED`: cancelled by the payer
+* `ACTIVE` -> `INACTIVE`: 
+
+![Payment states before](http://draft-public-api-documentation.s3-website-eu-west-1.amazonaws.com/agreement-states.dot.png)
+
+[Full Size Image](http://draft-public-api-documentation.s3-website-eu-west-1.amazonaws.com/agreement-states.dot.png)
+
+## Amending an agreement
+
+A payer may wish to amend an agreement, for example to change the bank account details or address, or frequency of payment. 
+
+Your service can make modifications to an agreement by calling the [Modify agreement](/reference/agreement/specific-agreement/modify-agreement) endpoint.
+
+For any such interaction, you are responsible for authenticating the user in an appropriately robust way and protecting user's personal information.
+
+GOV.UK Pay does not provide any specific mechanisms or support for user authentication.
+
+We assume that most services integrating with GOV.UK Pay which will take recurring payments will have a mechanism to authenticate users and therefore there is no point in us providing one.
+
+We would welcome feedback on this. 
+
+## Webhooks and events
+
+We will notify your service about asynchronous events by sending an HTTPS `POST` request to a URL you specify in GOV.UK Pay's admin interface. This is known as a 'Webhook'.
+
+The url you specifiy:
+- must be an HTTPS url.
+- must specify a hostname, not an IP address. 
+- the hostname must resolve to one or more IPv4 addresses.
+- can be configured only via the GOV.UK Pay selfservice interface (we don't support configuration by API to avoid privilege escalation).
+
+Your webhook endpoint must satisfy the following:
+- must support TLS 1.2+.
+- must present a valid certificate as per typical TLS rules (date, CN/subjectAlternativeNames, legitimate CA).
+- must validate the provided `Pay-Signature` header and return a `498 invalid token` response if the signature is invalid.
+- must respond with 200 OK if the webhook has been processed successfully.
+- must respond within 10 seconds.
+- must be idempotent in order to survive a lost acknowledgement. You record `webhook_id` and ignore any subsequent webhook with the same id.
+- must tolerate arbitrary change of origin IP address without notice.
+
+We will adhere to the following rules in when triggering outgoing webhooks:
+- TLS 1.2+.
+- redirects will not be followed.
+- will timeout after 10 seconds.
+- may change the source IP addresses of webhook calls without notice.
+- The `Pay-Signature` header will be an HMAC-SHA-256 digest of the body.
+- each webhook delivery identified by a `webhook_id` may contain one or more events.
+- webhook deliveries may be attempted one or many times. Failed deliveries (timeout or non-200 response code) will be retried according to an exponential backoff, for up to 7 days.
+- the list of events for a given `webhook_id` will always be consistent.
+
+Our selfservice interface will:
+- provide an option to view previous webhook calls, together with any response and provide a way to replay them.
+
+Each webhook delivery specifies a unique `webhook_id` allowing you to process notifications in an idempotent fashion.
+
+Each webhook delivery may contain one or more events. The types of events are:
+
+ Event Type            |  Description
+---------------------- | --------------
+`agreement.activated`  | the agreement has been activated
+`agreement.failed`     | the agreement could not be set up
+`agreement.cancelled`  | the agreement was cancelled either by the payer directly with their payment provider, or via the API
+`payment.confirmed`    | a pending payment was confirmed
+`payment.failed`       | a pending payment could not be processed
+`payment.charged_back` | the payer made an indemnity claim under the Direct Debit Guarantee scheme
+
+## Open questions
+
+### Reference numbers
+
+It's possible to control what appears as the reference code on payer's bank statements. We're not clear whether:
+- for a one-off payment, passing the `reference` would be appropriate. In this case we would need to truncate it to 10 characters.
+- for an ongoing payment agreement, whether the `reference` should:
+    - be the same for every transaction associated with the agreement
+    - vary according to some automatic rule for scheduled recurrences e.g. `reference-NN`
+    - vary arbitrarily for on demand payment collections
+
+# Data Structures
+
+## Payment Base
+
++ amount: 12000 (number, required) - the amount in pence to be requested
++ reference: `MRPC12345` (string, required) - a reference code determined by you, max 255 chars
++ description: `New passport application` (string, required)
++ return_url: `https://service-name.gov.uk/transactions/12345` (string, required) - the url that we return the user to
+
+## Persisted Payment (Payment Base)
+
++ payment_id: `654638a6-73a9-4fc7-8bee-148770948a1d` (string) - the identifier
++ state - (Payment State)
++ payment_provider: `sandbox` (enum)
++ created_date: `2018-02-21T16:04:25.844Z` (string) - ISO8601
++ refund_summary - (Refund summary)
++ settlement_summary - (Settlement summary)
++ _links
+  + self - (Link)
+  + next_url - (Next url)
+
+## Payment collected on demand
+
++ payment_id: `654638a6-73a9-4fc7-8bee-148770948a1d` (string) - the identifier
++ state - (Payment State)
+    + status: `pending` (string)
++ amount: 12000 (number, required) - the amount in pence to be requested
++ reference: `MRPC12345` (string, required) - a reference code determined by you, max 255 chars
++ description: `New passport application` (string, required)
++ payment_provider: `sandbox` (enum)
++ created_date: `2018-02-21T16:04:25.844Z` (string) - ISO8601
++ refund_summary - (Refund summary)
++ settlement_summary - (Settlement summary)
++ _links
+  + self - (Link)
+  + agreement - (Agreement Link)
+
+## Refund summary
+
++ status: `pending` (string) - status of the refund
++ amount_available: 12000 (number) - amount available to be refunded
++ amount_submitted: 0 (number) - amount which has been requested to be refunded already
+
+## Settlement summary
+
+## Link
+
++ href: `https://publicapi.payments.service.gov.uk/v1/payments/i8kvegechktugeed8dsfsld1j1` (string) - the url of this link
++ method: `GET` (string) - the HTTP verb for this link
+
+## Agreement Link
+
++ href: `https://publicapi.payments.service.gov.uk/v1/agreements/i8kvegechktugeed8dsfsld1j1` (string) - the url of this link
++ method: `GET` (string) - the HTTP verb for this link
+
+## Next url
+
++ href: `https://www.payments.service.gov.uk/secure/08e956f0-6d02-4c4a-9a13-782d9c7563d6` (string) - a single-use url. The paying user should be directed to this url to make their payment.
++ method: `GET` (string) - the HTTP verb for this link
+
+## Payment State
+
++ status: created (string) - status of the payment
++ finished: false (boolean) - whether this is a terminal state
+
+## Agreement Base
+
++ return_url (string)
++ agreement_type (enum)
+    * `ON_DEMAND` (string)
+    * `ONE_OFF` (string)
++ reference (string) - an optional reference which will be shown in the GOV.UK Pay selfservice interface, but never shown to a paying user. You can use this to propagate a reference from your CRM system, for example.
+
+## On Demand Agreement (Agreement Base)
+
++ return_url (string, required)
++ agreement_type (enum, required)
+    * `ON_DEMAND` (string)
+
+## Scheduled Agreement (Agreement Base)
+
++ name: John (string)
++ email: john@appleseed.com (string)
++ agreement_type (enum)
+    * `scheduled` (string)
++ schedule - (array[ScheduledPayment])
+
+## Recurring Agreement (Agreement Base)
+
++ name: John (string)
++ email: john@appleseed.com (string)
++ agreement_type (enum)
+    * `recurring` (string)
++ recurrence_rule - (RecurringAgreement)
+
+## Persisted Agreement (Agreement Base)
+
++ agreement_id: `08e956f0-6d02-4c4a-9a13-782d9c7563d6` (string, required) - identifier of the agreement
++ provider_id: `4c4a-6d02-9a13-782d9c7563d6-08e956f0` (string, required) - identifier of the agreement used by the Payment Service Provider. In the case of the Direct Debit this is the mandate reference that is shared with the paying user
++ status: `pending` (enum, required)
+    + `created` (string) - newly created via the api
+    + `started` (string) - the payer has visited GOV.UK Pay to initiate the payment process
+    + `submitted` (string) - the payer has provided their payment information but not yet confirmed their consent to the agreement
+    + `pending` (string) - consent has been given and the request has been made to the payment provider to authorise the payment method, and if requested to process the first payment
+    + `active` (string) - the issuing bank has confirmed that funding source is valid (eg. Direct Debit mandate)
+    + `failed` (string) - the issuing bank has rejected the funding source. Possible reasons: incorrect bank account details, bank account requires multiple signatories to setup a Direct Debit.
+    + `cancelled` (string) - cancelled by the payer
++ _links
+  + self - (Link)
+  + next_url - (Next url)
+  + payments_taken - (Link)
+    + href: `/payments?agreement_id=CQEWCE&state=collected`
+  + forthcoming_payments (Link)
+    + href: `/payments?agreement_id=CQEWCE&state=future`
++ reference (string) - an optional reference which will be shown in the GOV.UK Pay selfservice interface, but never shown to a paying user. You can use this to propagate a reference from your CRM system, for example.
+    
+
+## AgreementType (enum)
+
+* `on demand`
+* `scheduled`
+* `recurring`
+   
+## ScheduledPayment
+
++ date: `2018-03-23` (string, required) - the date when the payment will be taken ISO8601
++ amount: `12000` (number, required) - the amount in pence to be requested
+
+## RecurringAgreement
+
++ interval_type (enum)
+  + `daily`
+  + `weekly`
+  + `week_of_month`
+  + `monthly`
++ interval_size: 4 (number)
++ recurrence_start_date: `2018-02-23` (required, string) - ISO8601 date of the recurrence start
++ amount: `12000` (number, required) - the payment amount to be taken on each recurrence
+
+## Event
+
++ event_id: `ef792c37-181d-4394-b17c-45bf81e5ce6f` (string) - UUID of the event
++ event_time: `2018-03-12T16:25:01Z` (string) - ISO8601 timestamp when the event occurred
++ resource_type (enum) - the type of resource affected by the event
+  + `agreement`
+  + `payment`
+  + `refund`
++ event_type (string) - the type of the event
++ event_origin (enum) - origin of the event
+  + `payment provider` - from the payment provider, possibly triggered by a payer action 
+  + `api` - triggered by your service via the API
++ _links
+  + resource - (Link) - the resource affected by this event
+
+## Webhook
+
++ webhook_id: `ee1f4e14-133f-4f45-8b57-29ff24a052fa` (string) - UUID of the webhook delivery
++ events (array[Event]) - list of events included in this webhook callback
+
+## Error
+
++ code: `PXXXX` (enum)
+    + `P0101` - Missing mandatory attribute: The request you sent is missing a required attribute
+    + `P0102` - Invalid attribute value: The value of an attribute you sent is invalid
+    + `P0197` - Unable to parse JSON: The JSON you sent in the request body is invalid
+    + `P0198` - Downstream system error: Internal error with GOV.UK Pay: contact us, quoting the error code
+    + `P0199` - Account error: There is a problem with your service account: contact us, quoting the error code
+    + `P0200` - paymentId not found: No payment matched the paymentId you provided
+    + `P0298` - Downstream system error: Internal error with GOV.UK Pay: contact us, quoting the error code
+    + `P0300` - paymentId not found: No payment matched the paymentId you provided
+    + `P0398` - Downstream system error: Internal error with GOV.UK Pay: contact us, quoting the error code
+    + `P0401` - Invalid parameters: The parameters you sent are invalid.
+    + `P0402` - Page not found: The requested page of search results does not exist
+    + `P0498` - Downstream system error: Internal error with GOV.UK Pay: contact us, quoting the error code
+    + `P0500` - paymentId not found: No payment matched the paymentId you provided
+    + `P0501` - Cancellation failed: Cancelling the payment failed; contact us, quoting the error code
+    + `P0598` - Downstream system error: Internal error with GOV.UK Pay; contact us, quoting the error code
+    + `P0600` - paymentId not found: No payment matched the paymentId you provided
+    + `P0601` - Missing mandatory attribute: The request you sent is missing a required attribute
+    + `P0602` - Invalid attribute value: The value of an attribute you sent is invalid
+    + `P0603` - Refund not available: The payment is not available for refund.
+    + `P0604` - Refund amount available mismatch: The refundamountavailable value you provided does not match the true amount available to refund.
+    + `P0697` - Unable to parse JSON: The JSON you sent in the request body is invalid
+    + `P0698` - Downstream system error: Internal error with GOV.UK Pay; contact us, quoting the error code
+    + `P0700` - refundId not found: No refund matched the refundId you provided
+    + `P0798` - Downstream system error: Internal error with GOV.UK Pay; contact us, quoting the error code
+    + `P0800` - refundId not found: No refund match the refundId you provided
+    + `P0898` - Downstream system error: Internal error with GOV.UK Pay; contact us, quoting the error code
+    + `P0900` - Too many requests: Your service account is sending requests above the allowed rate; try the request again in a few seconds
+    + `P0920` - Request blocked by security rules: Our firewall blocked your request. See Troubleshooting section for details.
+    + `P1000` - Wrong agreement type - can only take on-demand payments from an on-demand agreement
+    + `P1001` - Invalid agreement state - can only take on-demand payments from an agreement in `pending` or `active` states
+    + `P0999` - GOV.UK Pay is unavailable: The GOV.UK Pay service is temporarily down.
++ description: `Message explaining the error` (string)
+
+
+# Group Agreement
+
+An `agreement` represents consent from a paying user with whom your service has an ongoing relationship. 
+
+You are responsible for authenticating and identifying the agreement.
+
+## Agreements collection [/v1/agreements/]
+
+### Create an agreement [POST]
+
++ Request
+    Create an agreement which allows on-demand payments to be collected
+    by the service
+    + Attributes (On Demand Agreement)
+
++ Response 201
+    + Attributes (Persisted Agreement)
+
++ Request
+    Create an agreement with a schedule defined by a list of dates
+    + Attributes (Scheduled Agreement)
+
++ Response 201
+    + Attributes (Persisted Agreement)
+        + schedule - (array[ScheduledPayment])
+
++ Request
+    Create an agreement with a schedule defined by a recurrence rule
+    + Attributes (Recurring Agreement)
+
++ Response 201
+    + Attributes (Persisted Agreement)
+        + recurrence_rule - (RecurringAgreement)
+
+
+
+## Specific Agreement [/v1/agreements/{agreement_id}]
+
++ Parameters
+    + agreement_id: `r8392ur89f` (required, UUID) - the ID of the agreement
+
+### Get agreement [GET]
+
++ Response 200
+    + Attributes (Persisted Agreement)
+
+
+### Cancel agreement [POST /v1/agreements/{agreement_id}/cancel]
+
+Cancels the agreement and any upcoming payments.
+
++ Response 200 (application/json)
+    + Attributes (Persisted Agreement)
+        
+
+### Modify agreement [PUT]
+
+Still a lot of details to be worked out about how this works. 
+Not everything relating to an agreement is modifiable. We are interested to 
+hear feedback about use cases and scenarios for modifying an agreement. 
+
+Some examples we can think of:
+- a user wants to modify their bank account details
+- a user wants to change the interval or timing of a recurring payment. What would the user journey be? 
+
+  For example we would expect to ask them again for explicit consent but ideally not re-ask for their bank account details. So for example we might have an endpoint to "modify schedule" which would give you a `next_url` where you can direct the user for them to give their explicit consent. Are there scenarios in which your service would solicit consent in another way (e.g. by telephone)? 
+
++ Response 200
+
+
+# Group Payments
+
+## Payments collection [/v1/payments]
+
+### Create a payment [POST]
+
+This endpoint can be used in two ways:
+
+1. to create a one-off payment request. See the [payment lifecycle](#introduction/payment-status-lifecycle-pending-status).
+2. to collect an on-demand payment from an existing `agreement`
+
+An on-demand payment collection will immediately be in the `pending` state:
+
+![payment states for payment collection](http://draft-public-api-documentation.s3-website-eu-west-1.amazonaws.com/external-payment-states-collection.dot.png)
+
++ Request Create payment (application/json)
+    Request a one-off payment without establishing an agreement usable for ongoing payments.
+
+    The same API can be used to take both one-off card and one-off Direct Debit payments.
+    
+    After creating the payment, the paying user should be directed to the URL specified in `_links/next_url`.
+    
+    + Attributes (Payment Base)
+
++ Response 201 (application/json)
+    + Attributes (Persisted Payment)
+
++ Request Create payment from agreement (application/json)
+    Request a single payment from an existing agreement.
+    
+    The `agreement_type` of the agreement must be `on demand` and its `status` must be either `pending` or `active`.
+    
+    The payment will be taken as soon as possible (for Direct Debit payments, this typically means in a few working days).
+    
+    The returned payment will initially be in the `pending` state before later changing to one of the terminal states.
+    
+    + Attributes
+        + agreement_id: `08e956f0-6d02-4c4a-9a13-782d9c7563d6` (string, required) - identifier of the agreement
+        + amount: 1200 (number, required) - the payment amount to be taken in pence
+        + reference: `MRPC12345` (string, required) - reference code determined by you, max 255 chars. 
+        + description: `Monthly driving licence installment - March 2018` (string, required) - human readable description which will appear on email notifications for this payment.
+
++ Response 201 (application/json)
+    Successful payment
+    
+    + Attributes (Payment collected on demand)
+
+
++ Response 400 (application/json)
+    Cannot create payment
+    
+    + Attributes (Error)
+        + code: `P1000` (enum)
+            + `P1000` - Wrong agreement type - can only take on-demand payments from an on-demand agreement
+            + `P1001` - Invalid agreement state - can only take on-demand payments from an agreement in `pending` or `active` states
+
+### Search payments by agreement [GET /v1/payments?agreement_id={agreement_id}]
+
++ Parameters
+    + agreement_id: `08e956f0-6d02-4c4a-9a13-782d9c7563d6` (string) - id of the agreement
+
++ Response 200
+    + Attributes
+        * payments (array[Persisted Payment])
+
+## Single payment [/v1/payments/{payment_id}]
+
++ Parameters
+    + payment_id (string)
+
+### Get one payment [GET]
+
+This works for one-off payments and payments collected from an agreement.
+
++ Response 200
+    + Attributes (Persisted Payment)
+
+# Group Webhooks
+
+Note webhooks are target at a URL on *your* service. This section of the docs incorrectly shows the URL as `http://publicapi.payments.service.gov.uk/your/url`. This is an example only. The actual target URL of the webhook will be specified by you in the GOV.UK Pay selfservice interface.
+
+## Webhook notifications [/your/url]
+
++ Attributes (Webhook)
+
+### Webhook notification [POST]
+
++ Request
+    + Attributes (Webhook)
+    
+    + Headers
+    
+            Pay-Signature: HMAC-SHA-256 digest of the body.
+
++ Response 200
+    If the signature was valid and the request was processed successfully
+    
+    + Attributes
+
++ Response 498
+    If the signature was invalid
+
+    + Attributes
+
+# Group Events
+
+We *may* provide an API to enquire about historical events.
+
+## Events [/v1/events{?before,after,page_size,page,agreement_id,payment_id,refund_id}]
+
++ Parameters
+    + before: `2018-03-13T10:00:04Z` (string)
+    + after: `2018-03-13T10:00:04Z` (string)
+    + page_size: 100 (number) - maximum 500
+    + page: 1 (number)
+    + agreement_id: `fa2d8c72-e68b-4db8-812d-4417f89345a0` (string) - UUID of associated agreement
+    + payment_id: `93672c1b-d21f-46b7-a0e7-a3ed6145985e` (string) - UUID of associated payment
+    + refund_id: `6b360bf0-14c9-4a16-9a9f-014f5ef7f206` (string) - UUID of associated refund
+    
++ Attributes
+    + count: 103 (number)
+    + events - array[Event]
+
+### Get events [GET]
+
++ Response 200
+    + Attributes
+        + count: 103 (number)
+        + events (array[Event])
+        + _links:
+            + next_page (Link)
+            + previous_page (Link)
